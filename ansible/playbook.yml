@@ -1,0 +1,157 @@
+---
+- hosts: azure_vm
+  become: true
+
+  vars:
+    acr_registry: "{{ lookup('env', 'ACR_SERVER') }}"
+    acr_username: "{{ lookup('env', 'ACR_ADMIN_USERNAME') }}"
+    acr_password: "{{ lookup('env', 'ACR_ADMIN_PASSWORD') }}"
+    image_name: "static-web"
+    image_tag: "latest"
+    repo_url: "https://github.com/alfonsoropero583/static-web.git"
+    workspace: ~/git/static-web
+
+  tasks:
+# Esta tarea establece el idioma del sistema en español.  
+  - name: Set locale to es_ES.UTF-8
+    ansible.builtin.raw: |
+      export LANGUAGE=es_ES.UTF-8
+      export LANG=es_ES.UTF-8
+      export LC_ALL=es_ES.UTF-8
+    changed_when: false
+
+## Actualizacion de la maquina
+
+# Esta tarea Actualiza los repositorios de paquetes en el servidor.
+  - name: Actualizar repositorios
+    apt:
+      update_cache: yes
+
+# Esta tarea instala los paquetes necesarios para el servidor.      
+  - name: Instalar paquetes necesarios
+    apt:
+      name: ['software-properties-common', 'ca-certificates', 'curl', 'gnupg', 'lsb-release', 'git', 'npm', 'python3', 'python3-pip']
+      state: present
+
+# Esta tarea Instalar Podman en el servidor.
+  - name: Instalar Podman
+    apt:
+      name: podman
+      state: present
+
+## Preparar Imagen del Contenedor
+
+# Esta tarea clona el repositorio de Git en el directorio de trabajo especificado.
+  - name: Git Clone Repositorio
+    git:
+      repo: "{{ repo_url }}"
+      dest: "{{ workspace }}"
+
+# Esta tarea construye una imagen de contenedor utilizando el Dockerfile ubicado en el directorio de trabajo.
+  - name: Build imagen desde Dockerfile
+    containers.podman.podman_image:
+      name: "{{ image_name }}"
+      path: "{{ workspace }}"
+      build:
+        format: docker
+
+## Subir Contenedor a ACR y Desplegar.
+
+# Esta tarea inicia sesión en el registro de contenedores de Azure.
+  - name: "Iniciar sesión en ACR"
+    containers.podman.podman_login:
+      registry: "{{ acr_registry }}"
+      username: "{{ acr_username }}"
+      password: "{{ acr_password }}"
+
+# Esta tarea etiqueta la imagen de contenedor creada con el nombre y etiqueta especificados.
+  - name: Etiquetar imagen de Podman
+    command: podman tag {{ image_name }}:{{ image_tag }} {{ acr_registry }}/{{ image_name }}:{{ image_tag }}
+
+# Esta tarea sube la imagen de contenedor al registro de contenedores de Azure.
+  - name: Subir imagen a ACR
+    become: true
+    command: podman push {{ acr_registry }}/{{ image_name }}:{{ image_tag }}
+
+# Esta tarea despliega la imagen de contenedor en Podman y expone el puerto 80 para el tráfico web.
+  - name: Desplegar imagen en Podman
+    containers.podman.podman_container:
+      name: "{{ image_name }}"
+      image: "{{ acr_registry }}/{{ image_name }}:{{ image_tag }}"
+      state: started
+      ports:
+        - "80:80"
+
+## Kubernetes y AKS
+
+# Esta tarea instala el módulo de Python kubernetes.
+  - name: Instalar el módulo de Python kubernetes
+    ansible.builtin.pip:
+      name: kubernetes
+      executable: pip3
+
+# Esta tarea crea el directorio .kube en el directorio de trabajo del usuario.
+  - name: Crear directorio .kube
+    file:
+      path: ~/.kube
+      state: directory
+
+#  Esta tarea copia el archivo de configuración de AKS en el directorio de trabajo del usuario.
+  - copy:
+      content: "{{ lookup('env', 'AKS_KUBE_CONFIG') }}"
+      dest: ~/.kube/config
+      mode: 0600
+
+# Esta tarea configura el contexto de Kubernetes para apuntar al clúster de AKS.
+  - name: Crear recursos de Kubernetes
+    kubernetes.core.k8s:
+      kubeconfig: ~/.kube/config
+      state: present
+      definition:
+        apiVersion: v1
+        kind: List
+        items:
+          - kind: Pod
+            metadata:
+              name: pod-static-web
+              namespace: default
+            spec:
+              containers:
+                - name: "{{ image_name }}"
+                  image: "{{ acr_registry }}/{{ image_name }}:{{ image_tag }}"              
+
+# Esta tarea expone el servicio de la aplicación en un puerto accesible externamente.
+  - name: Exponer servicio de la aplicación
+    kubernetes.core.k8s:
+      kubeconfig: ~/.kube/config
+      state: present
+      definition:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: service-static-web
+          namespace: default
+        spec:
+          type: LoadBalancer
+          ports:
+            - port: 80
+              targetPort: 80
+          selector:
+            app: pod-static-web
+
+# Esta tarea espera a que la aplicación esté en funcionamiento y obtiene la IP asignada.
+  - name: "Esperar y obtener IP de la aplicación"
+    kubernetes.core.k8s_info:
+      kubeconfig: ~/.kube/config
+      kind: Service
+      name: service-static-web
+      namespace: default
+    register: service_info
+    until: service_info.resources[0].status.loadBalancer.ingress[0].ip is defined
+    retries: 20
+    delay: 10
+
+# Esta tarea muestra la IP de la aplicación en la salida.
+  - name: Mostrar IP de la aplicación
+    debug:
+      msg: "La IP de la aplicación es {{ service_info.resources[0].status.loadBalancer.ingress[0].ip }}"
